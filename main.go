@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,53 +13,56 @@ import (
 )
 
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second, // Устанавливаем тайм-аут для всех запросов
+	Timeout: 10 * time.Second,
 }
 
-// ResponseData - структура для хранения информации о каждом запросе
 type ResponseData struct {
 	URL        string `json:"url"`
 	StatusCode int    `json:"status_code"`
 	Body       string `json:"body"`
-	Error      string `json:"error,omitempty"` // Поле для ошибок (опционально)
+	Error      string `json:"error,omitempty"`
 }
 
-// sendReq отправляет запрос и возвращает результат в канал
 func sendReq(
 	wg *sync.WaitGroup,
-	startSignal chan struct{},
+	startGroup *sync.WaitGroup,
 	results chan<- ResponseData,
 	url string,
 	method string,
 	headers http.Header,
-	body io.Reader,
+	body []byte,
 ) {
 	defer wg.Done()
 
-	//client := &http.Client{}
-	req, err := http.NewRequest(method, url, body)
+	reqBody := bytes.NewReader(body)
+
+	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
 		results <- ResponseData{URL: url, Error: fmt.Sprintf("Ошибка при создании запроса: %v", err)}
 		return
 	}
 
 	req.Header = headers
+	startGroup.Wait()
 
-	<-startSignal
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		results <- ResponseData{URL: url, Error: fmt.Sprintf("Ошибка при запросе: %v", err)}
+		results <- ResponseData{URL: url, Error: fmt.Sprintf("Ошибка при выполнении запроса: %v", err)}
 		return
 	}
-	defer func(Body io.ReadCloser) {
-		if err := Body.Close(); err != nil {
-			log.Printf("Ошибка при закрытии тела ответа: %v\n", err)
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("Ошибка при закрытии тела ответа: %v\n", cerr)
 		}
-	}(resp.Body)
+	}()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		results <- ResponseData{URL: url, StatusCode: resp.StatusCode, Error: fmt.Sprintf("Ошибка при чтении тела ответа: %v", err)}
+		results <- ResponseData{
+			URL:        url,
+			StatusCode: resp.StatusCode,
+			Error:      fmt.Sprintf("Ошибка при чтении тела ответа: %v", err),
+		}
 		return
 	}
 
@@ -69,13 +73,10 @@ func sendReq(
 	}
 }
 
-// loadAndFire - обработчик для отправки запросов и возврата результатов в формате JSON
 func loadAndFire(w http.ResponseWriter, r *http.Request) {
-	var wg sync.WaitGroup
-	startSignal := make(chan struct{})
 	numRequests, err := strconv.Atoi(r.Header.Get("RC_GO_COUNT"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "Некорректное значение RC_GO_COUNT", http.StatusBadRequest)
 		return
 	}
 
@@ -88,48 +89,75 @@ func loadAndFire(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("RC_GO_COUNT")
 	r.Header.Del("RC_GO_URL")
 
-	// Канал для результатов запросов
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Ошибка чтения тела запроса: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	copiedHeaders := copyHeaders(r.Header)
+
+	var wg sync.WaitGroup
+	var startGroup sync.WaitGroup
+	startGroup.Add(1)
 	results := make(chan ResponseData, numRequests)
 
 	start := time.Now()
+
 	for i := 0; i < numRequests; i++ {
 		wg.Add(1)
-		go sendReq(&wg, startSignal, results, url, r.Method, r.Header, r.Body)
+		go sendReq(
+			&wg,
+			&startGroup,
+			results,
+			url,
+			r.Method,
+			copiedHeaders,
+			requestBody,
+		)
 	}
-	close(startSignal)
-	// Ждем завершения всех запросов
+
+	startGroup.Done()
+
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
 	// Сбор всех результатов из канала
-	var responses []ResponseData
+	var responses = make([]ResponseData, 0, numRequests)
 	for result := range results {
 		responses = append(responses, result)
 	}
+
 	elapsed := time.Since(start)
 
-	// Создание окончательного ответа
 	finalResponse := map[string]interface{}{
 		"duration": elapsed.String(),
 		"results":  responses,
 	}
 
-	// Кодируем ответ в JSON
 	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(finalResponse)
-	if err != nil {
+	if err := json.NewEncoder(w).Encode(finalResponse); err != nil {
 		http.Error(w, fmt.Sprintf("Ошибка кодирования JSON: %v", err), http.StatusInternalServerError)
 	}
+}
+
+func copyHeaders(hdr http.Header) http.Header {
+	copied := make(http.Header, len(hdr))
+	for k, vv := range hdr {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		copied[k] = vv2
+	}
+	return copied
 }
 
 func main() {
 	http.HandleFunc("/load_and_fire/", loadAndFire)
 
 	fmt.Println("Сервер запущен на порту 8080...")
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
+	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Ошибка запуска сервера: %v\n", err)
 	}
 }
