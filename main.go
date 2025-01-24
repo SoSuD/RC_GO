@@ -157,7 +157,7 @@ func main() {
 	http.HandleFunc("/load_and_fire/", loadAndFire)
 
 	fmt.Println("Сервер запущен на порту 8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err := http.ListenAndServe(":8081", nil); err != nil {
 		log.Fatalf("Ошибка запуска сервера: %v\n", err)
 	}
 }
